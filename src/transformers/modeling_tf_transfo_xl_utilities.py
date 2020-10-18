@@ -32,142 +32,128 @@ class TFAdaptiveSoftmaxMask(tf.keras.layers.Layer):
 
         self.cutoffs = cutoffs + [vocab_size]
         self.cutoff_ends = [0] + self.cutoffs
-        self.div_val = div_val
+        self.n_clusters = len(cutoffs) - 1
 
-        self.shortlist_size = self.cutoffs[0]
-        self.n_clusters = len(self.cutoffs) - 1
-        self.head_size = self.shortlist_size + self.n_clusters
+        self.div_val = div_val
         self.keep_order = keep_order
 
-        self.out_layers = []
+        self.out_weights = []
+        self.out_biases = []
         self.out_projs = []
 
     def build(self, input_shape):
         if self.n_clusters > 0:
             self.cluster_weight = self.add_weight(
-                shape=(self.n_clusters, self.d_embed), initializer="zeros", trainable=True, name="cluster_weight"
+                shape=(self.n_clusters, self.d_embed), initializer="zeros", \
+                    trainable=True, name="cluster_weight"
             )
             self.cluster_bias = self.add_weight(
-                shape=(self.n_clusters,), initializer="zeros", trainable=True, name="cluster_bias"
+                shape=(self.n_clusters,), initializer="zeros", trainable=True, \
+                    name="cluster_bias"
             )
 
-        if self.div_val == 1:
-            for i in range(len(self.cutoffs)):
-                if self.d_proj != self.d_embed:
-                    weight = self.add_weight(
-                        shape=(self.d_embed, self.d_proj),
+        for i in range(len(self.cutoffs)):
+            l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
+            d_emb_i = self.d_embed // (self.div_val ** i)
+            self.out_weights.append(
+                self.add_weight(
+                    shape=(r_idx - l_idx, d_emb_i),
+                    initializer="zeros",
+                    trainable=True,
+                    name="out_weights_._{}".format(i),
+                )
+            )
+            self.out_biases.append(
+                self.add_weight(
+                    shape=(r_idx - l_idx,),
+                    initializer="zeros",
+                    trainable=True,
+                    name="out_layers_._{}_.bias".
+                        format(i)
+                )
+            )
+
+            if d_emb_i == d_proj and self.div_val == 1:
+                self.emb_projs.append(None)
+            else:
+                self.emb_projs.append(
+                    self.add_weight(
+                        shape=(d_emb_i, self.d_proj),
                         initializer="zeros",
                         trainable=True,
                         name="out_projs_._{}".format(i),
                     )
-                    self.out_projs.append(weight)
-                else:
-                    self.out_projs.append(None)
-                weight = self.add_weight(
-                    shape=(
-                        self.vocab_size,
-                        self.d_embed,
-                    ),
-                    initializer="zeros",
-                    trainable=True,
-                    name="out_layers_._{}_._weight".format(i),
                 )
-                bias = self.add_weight(
-                    shape=(self.vocab_size,),
-                    initializer="zeros",
-                    trainable=True,
-                    name="out_layers_._{}_._bias".format(i),
-                )
-                self.out_layers.append((weight, bias))
-        else:
-            for i in range(len(self.cutoffs)):
-                l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
-                d_emb_i = self.d_embed // (self.div_val ** i)
-
-                weight = self.add_weight(
-                    shape=(d_emb_i, self.d_proj), initializer="zeros", trainable=True, name="out_projs_._{}".format(i)
-                )
-                self.out_projs.append(weight)
-                weight = self.add_weight(
-                    shape=(
-                        r_idx - l_idx,
-                        d_emb_i,
-                    ),
-                    initializer="zeros",
-                    trainable=True,
-                    name="out_layers_._{}_._weight".format(i),
-                )
-                bias = self.add_weight(
-                    shape=(r_idx - l_idx,),
-                    initializer="zeros",
-                    trainable=True,
-                    name="out_layers_._{}_._bias".format(i),
-                )
-                self.out_layers.append((weight, bias))
-        super().build(input_shape)
 
     @staticmethod
     def _logit(x, W, b, proj=None):
         y = x
-        if proj is not None:
-            y = tf.einsum("ibd,ed->ibe", y, proj)
-        return tf.einsum("ibd,nd->ibn", y, W) + b
+        if x.shape.ndims == 3:
+            if proj is not None:
+                y = tf.einsum("ibd,ed->ibe", y, proj)
+            return tf.einsum("ibd,nd->ibn", y, W) + b
+        else:
+            if proj is not None:
+                y = tf.einsum('id,ed->ie', y, proj)
+            return tf.einsum('id,nd->in', y, W) + b
 
     @staticmethod
     def _gather_logprob(logprob, target):
-        lp_size = shape_list(logprob)
+        lp_size = shape_list(target)
         r = tf.range(lp_size[0])
-        idx = tf.stack([r, target], 1)
+        c = tf.range(lp_size[1])
+        C, R = tf.meshgrid(c, r)
+        idx = tf.stack([R, C, target], axis=2)
         return tf.gather_nd(logprob, idx)
 
     def call(self, hidden, target, return_mean=True, training=False):
         head_logprob = 0
         if self.n_clusters == 0:
-            output = self._logit(hidden, self.out_layers[0][0], self.out_layers[0][1], self.out_projs[0])
+            output = self._logit(hidden, self.out_weights[0], self.out_biases[0], self.out_projs[0])
+            out = tf.nn.log_softmax(output, axis=-1)
             if target is not None:
                 loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=target, logits=output)
-            out = tf.nn.log_softmax(output, axis=-1)
         else:
             hidden_sizes = shape_list(hidden)
             out = []
             loss = tf.zeros(hidden_sizes[:2], dtype=tf.float32)
             for i in range(len(self.cutoffs)):
                 l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
+
                 if target is not None:
                     mask = (target >= l_idx) & (target < r_idx)
-                    mask_idx = tf.where(mask)
-                    cur_target = tf.boolean_mask(target, mask) - l_idx
+                    cur_target = tf.minimum(target, r_idx-1)
+                    cur_target = tf.maximum(cur_target-l_idx, 0)
 
-                if self.div_val == 1:
-                    cur_W = self.out_layers[0][0][l_idx:r_idx]
-                    cur_b = self.out_layers[0][1][l_idx:r_idx]
-                else:
-                    cur_W = self.out_layers[i][0]
-                    cur_b = self.out_layers[i][1]
+                cur_W = self.out_weights[i]
+                cur_b = self.out_biases[i]
+                cur_P = self.out_projs[i]
 
                 if i == 0:
                     cur_W = tf.concat([cur_W, self.cluster_weight], 0)
                     cur_b = tf.concat([cur_b, self.cluster_bias], 0)
 
-                    head_logit = self._logit(hidden, cur_W, cur_b, self.out_projs[0])
+                    head_logit = self._logit(hidden, cur_W, cur_b, cur_P)
                     head_logprob = tf.nn.log_softmax(head_logit)
-                    out.append(head_logprob[..., : self.cutoffs[0]])
+                    out.append(head_logprob[..., :self.cutoffs[0]])
+                        
                     if target is not None:
-                        cur_head_logprob = tf.boolean_mask(head_logprob, mask)
-                        cur_logprob = self._gather_logprob(cur_head_logprob, cur_target)
+                        cur_loss = self._gather_logprob(head_logprob, cur_target)
+                        loss = tf.where(mask, cur_loss, loss)
                 else:
-                    tail_logit = self._logit(hidden, cur_W, cur_b, self.out_projs[i])
+                    tail_logit = self._logit(hidden, cur_W, cur_b, cur_P)
                     tail_logprob = tf.nn.log_softmax(tail_logit)
-                    cluster_prob_idx = self.cutoffs[0] + i - 1  # No probability for the head cluster
+
+                    cluster_prob_idx = self.cutoffs[0] + i - 1
                     logprob_i = head_logprob[..., cluster_prob_idx, None] + tail_logprob
                     out.append(logprob_i)
+
                     if target is not None:
-                        cur_head_logprob = tf.boolean_mask(head_logprob, mask)
-                        cur_tail_logprob = tf.boolean_mask(tail_logprob, mask)
-                        cur_logprob = self._gather_logprob(cur_tail_logprob, cur_target)
-                        cur_logprob += cur_head_logprob[:, self.cutoff_ends[1] + i - 1]
-                if target is not None:
-                    loss += tf.scatter_nd(mask_idx, -cur_logprob, tf.cast(shape_list(loss), dtype=tf.int64))
+                        cur_loss = self._gather_logprob(logprob_i, cur_target)
+                        loss = tf.where(mask, cur_loss, loss)
+
+            if target is not None:
+                loss = -loss
             out = tf.concat(out, axis=-1)
 
         if target is not None:
